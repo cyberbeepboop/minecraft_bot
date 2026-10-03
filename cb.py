@@ -1,4 +1,9 @@
 
+
+#EDIT
+#this is a older version. download newest ones in the releases tab! 
+#github.com/cyberbeepboop/minecraft_bot/releases/latest < this
+
 import json
 import os
 import re
