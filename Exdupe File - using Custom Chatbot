@@ -1,0 +1,166 @@
+import random
+import re
+import time
+from threading import RLock, Timer
+
+from cb import MinecraftChatBot
+
+ORDER_TIMEOUT = 10
+TPA_TIMEOUT = 10
+COOLDOWN_PATTERN = re.compile(r"time before next teleport:\s*(\d+)\s+seconds?", re.IGNORECASE)
+
+
+class KitOrderManager:
+    def __init__(self, bot: MinecraftChatBot):
+        self.bot = bot
+        self.queue: list[str] = []
+        self.active_player: str | None = None
+        self.confirmation_code: str | None = None
+        self.phase: str | None = None
+        self.timer: Timer | None = None
+        self.lock = RLock()
+
+    def start(self) -> None:
+        self.bot.when_message_in_log(self.on_chat, message_type="chat")
+        self.bot.when_message_in_log(self.on_system_message, message_type="system")
+
+    def _set_timer(self, seconds: int, callback, *args) -> None:
+        self._cancel_timer()
+        self.timer = Timer(seconds, callback, args=args)
+        self.timer.start()
+
+    def _cancel_timer(self) -> None:
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+
+    def _start_order(self, player: str) -> None:
+        import pyautogui
+
+        self.active_player = player
+        self.phase = "confirm"
+        self.confirmation_code = str(random.randint(1000, 9999))
+        self.bot.whisper(player, "Thanks for ordering!")
+        pyautogui.press("1")
+        self.bot.send_message("/dupe")
+        self.bot.whisper(player, f"Type this 4-digit number in chat to confirm: {self.confirmation_code}")
+        self._set_timer(ORDER_TIMEOUT, self._on_timeout, player, "confirm")
+
+    def _next_order(self) -> None:
+        self._cancel_timer()
+        self.active_player = None
+        self.confirmation_code = None
+        self.phase = None
+        if self.queue:
+            self._start_order(self.queue.pop(0))
+
+    def _on_timeout(self, player: str, phase: str) -> None:
+        with self.lock:
+            if self.active_player != player or self.phase != phase:
+                return
+            self.timer = None
+            reasons = {
+                "confirm": "You did not enter the confirmation number in time.",
+                "waiting_accept": f"You did not accept the tpa within {TPA_TIMEOUT} seconds.",
+                "teleporting": "The teleport did not complete in time.",
+            }
+            self.bot.whisper(player, f"Your order was cancelled. {reasons[phase]}")
+            self._next_order()
+
+    def on_chat(self, message: dict[str, str | None]) -> None:
+        player = message["player"] or "Unknown"
+        text = (message["message"] or "").strip()
+        print(f"{player}: {text}")
+
+        if text.casefold() in {"!kit 1", "!kit reg"}:
+            with self.lock:
+                player_key = player.casefold()
+                if player_key in self.bot.blacklist:
+                    self.bot.whisper(player, "You are not allowed to place an order.")
+                elif player_key == (self.active_player or "").casefold() or any(name.casefold() == player_key for name in self.queue):
+                    self.bot.whisper(player, "You already have an order in the queue.")
+                elif self.active_player is None:
+                    self._start_order(player)
+                else:
+                    self.queue.append(player)
+                    self.bot.whisper(player, f"Added to the queue. Your position is {len(self.queue) + 1}.")
+            return
+
+        with self.lock:
+            if not self.active_player or player.casefold() != self.active_player.casefold() or self.phase != "confirm":
+                return
+            if len(text) != 4 or not text.isascii() or not text.isdigit():
+                return
+            if text != self.confirmation_code:
+                self.bot.whisper(player, "That confirmation number is incorrect. Try again.")
+                return
+
+            self._cancel_timer()
+            self.phase = "waiting_accept"
+            self.bot.send_message(f"/tpa {self.active_player}")
+            self.bot.whisper(player, f"Please accept the tpa within {TPA_TIMEOUT} seconds.")
+            self._set_timer(TPA_TIMEOUT, self._on_timeout, player, "waiting_accept")
+
+    def on_system_message(self, message: dict[str, str | None]) -> None:
+        text = (message["message"] or "").casefold()
+        with self.lock:
+            player = self.active_player
+            if not player:
+                return
+
+            cooldown = COOLDOWN_PATTERN.search(text)
+            if cooldown and self.phase in {"waiting_accept", "teleporting"}:
+                seconds = int(cooldown.group(1))
+                self.phase = "cooldown"
+                self.bot.whisper(player, f"Teleport cooldown. I will retry in {seconds} seconds.")
+                self._set_timer(seconds, self._retry_tpa, player)
+                return
+
+            if self.phase not in {"waiting_accept", "teleporting"}:
+                return
+            if "pending teleportation request cancelled" in text:
+                self.bot.whisper(player, "The teleport request was cancelled; your order has been cancelled.")
+                self._next_order()
+                return
+
+            player_key = player.casefold()
+            accepted = f"{player_key} accepted your teleport request" in text
+            teleporting = f"teleporting to {player_key}" in text or "teleportation will commence" in text
+            if self.phase == "waiting_accept" and (accepted or teleporting):
+                self.phase = "teleporting"
+                self._set_timer(ORDER_TIMEOUT, self._on_timeout, player, "teleporting")
+            elif self.phase == "teleporting" and (
+                "teleportation commencing" in text or f"you have been teleported to {player_key}" in text
+            ):
+                self._deliver(player)
+
+    def _retry_tpa(self, player: str) -> None:
+        with self.lock:
+            if self.active_player != player or self.phase != "cooldown":
+                return
+            self.timer = None
+            self.phase = "waiting_accept"
+            self.bot.send_message(f"/tpa {player}")
+            self.bot.whisper(player, f"Please accept the tpa within {TPA_TIMEOUT} seconds.")
+            self._set_timer(TPA_TIMEOUT, self._on_timeout, player, "waiting_accept")
+
+    def _deliver(self, player: str) -> None:
+        import pyautogui
+
+        self._cancel_timer()
+        pyautogui.press("2")
+        pyautogui.press("q")
+        with pyautogui.hold("s"), pyautogui.hold("shift"):
+            time.sleep(1)
+        self.bot.whisper(player, "Your order was delivered. Thanks for ordering!")
+        time.sleep(8)
+        self.bot.send_message("/home")
+        self._next_order()
+
+
+bot = MinecraftChatBot()
+orders = KitOrderManager(bot)
+orders.start()
+
+if __name__ == "__main__":
+    bot.run(display_messages=False)
