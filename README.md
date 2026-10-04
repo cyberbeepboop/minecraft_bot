@@ -9,3 +9,7 @@ run cb.py
 just make a new python file in the same directory of cb.py
 run from cb.py import MinecraftChatBot
 and then like use it idk
+
+
+guys should i make a wiki
+its not even that hard
