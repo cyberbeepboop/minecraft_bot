@@ -15,3 +15,7 @@ its not even that hard
 # reasons for use
 easier then mineflayer ig
 also worse then mineflayer
+
+
+# template might be out of date
+i dont want to keep redoing it
